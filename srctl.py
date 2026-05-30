@@ -38,6 +38,17 @@ def _write_prefs_bulk(updates):
     prefs.update(updates)
     with open(PREFS_PLIST, "wb") as f:
         plistlib.dump(prefs, f, fmt=plistlib.FMT_BINARY)
+    _flush_prefs_cache()
+
+
+def _flush_prefs_cache():
+    try:
+        subprocess.run(
+            ["killall", "cfprefsd"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def get_active_server_uuid():
@@ -84,12 +95,18 @@ def _quit_shadowrocket(timeout=5.0):
 
 
 def _launch_shadowrocket(timeout=10.0):
-    subprocess.run(["open", "-a", "Shadowrocket"], capture_output=True)
+    result = subprocess.run(
+        ["open", "-a", "Shadowrocket"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: 'open -a Shadowrocket' returned {result.returncode}: {result.stderr.strip()}", file=sys.stderr)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _is_shadowrocket_running():
             return True
         time.sleep(0.2)
+    print(f"Warning: Shadowrocket did not appear within {timeout}s", file=sys.stderr)
     return _is_shadowrocket_running()
 
 
