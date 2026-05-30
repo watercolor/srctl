@@ -9,12 +9,14 @@ import json
 import os
 import plistlib
 import select
+import socket
 import subprocess
 import sys
 import tempfile
 import termios
 import time
 import tty
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 GROUP_CONTAINER = os.path.expanduser(
     "~/Library/Group Containers/group.com.liguangming.Shadowrocket"
@@ -664,6 +666,89 @@ def _interactive_pick_server(servers, prompt="Select server"):
     return name, srv
 
 
+def _tcp_ping(host, port, timeout=3.0):
+    start = time.monotonic()
+    try:
+        family = socket.AF_INET
+        if ":" in host:
+            family = socket.AF_INET6
+            host = host.strip("[]")
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        sock.close()
+        return time.monotonic() - start
+    except Exception:
+        return None
+
+
+def cmd_ping(args):
+    servers = load_servers()
+    if not servers:
+        print("No servers found.", file=sys.stderr)
+        return
+
+    if args.server:
+        found = _find_server(servers, args.server)
+        if not found:
+            print(f"No server matching '{args.server}' found.", file=sys.stderr)
+            return
+        targets = {found[0]: found[1]}
+    else:
+        targets = {
+            k: v for k, v in servers.items()
+            if v.get("_class") in ("DLWServer",)
+        }
+
+    testable = {}
+    for name, srv in targets.items():
+        host = srv.get("host", "")
+        port = srv.get("port", "")
+        if not host or not port:
+            continue
+        try:
+            int(port)
+        except (ValueError, TypeError):
+            continue
+        testable[name] = srv
+
+    if not testable:
+        print("No testable servers found.", file=sys.stderr)
+        return
+
+    print(f"Testing {len(testable)} server(s)...\n")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = {}
+        for name, srv in testable.items():
+            host = srv.get("host", "")
+            port = int(srv.get("port", ""))
+            futures[executor.submit(_tcp_ping, host, port)] = (name, srv)
+
+        for future in as_completed(futures):
+            name, srv = futures[future]
+            latency = future.result()
+            results.append((name, srv, latency))
+
+    results.sort(key=lambda x: (x[2] is None, x[2] or float("inf")))
+
+    print(f"  {'Latency':<10} {'Title':<40} {'Host':<25} {'Port':<8}")
+    print("  " + "-" * 83)
+    for name, srv, latency in results:
+        host = srv.get("host", "")
+        port = srv.get("port", "")
+        title = name[:38]
+        if latency is not None:
+            ms = latency * 1000
+            mark = "+" if ms < 200 else ("~" if ms < 500 else "-")
+            latency_str = f"{ms:6.0f}ms"
+        else:
+            mark = "x"
+            latency_str = "  --- "
+        print(f"  [{mark}] {latency_str:<6}  {title:<40} {host:<25} {port:<8}")
+
+
 def cmd_active(args):
     servers = load_servers()
     uuid = get_active_server_uuid()
@@ -710,6 +795,8 @@ Examples:
     sp.add_argument("key", help="Property name")
     sp.add_argument("value", nargs="?", default=None, help="New value (interactive picker for 'chain' if omitted)")
     sub.add_parser("export", help="Export all servers as JSON")
+    sp = sub.add_parser("ping", help="Test server connectivity (TCP)")
+    sp.add_argument("server", nargs="?", default=None, help="Specific server (omit to test all)")
 
     args = parser.parse_args()
 
@@ -717,6 +804,7 @@ Examples:
         "on": cmd_on, "off": cmd_off, "toggle": cmd_toggle,
         "list": cmd_list, "switch": cmd_switch, "config": cmd_config,
         "set": cmd_set, "export": cmd_export, "active": cmd_active,
+        "ping": cmd_ping,
     }
 
     handler = commands.get(args.command)
