@@ -8,10 +8,13 @@ import argparse
 import json
 import os
 import plistlib
+import select
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
 
 GROUP_CONTAINER = os.path.expanduser(
     "~/Library/Group Containers/group.com.liguangming.Shadowrocket"
@@ -406,11 +409,18 @@ def cmd_switch(args):
     if not servers:
         print("No servers found.", file=sys.stderr)
         return
-    found = _find_server(servers, args.server)
-    if not found:
-        print(f"No server matching '{args.server}' found.", file=sys.stderr)
-        return
-    name, srv = found
+    if args.server is None:
+        found = _interactive_pick_server(servers)
+        if found is None:
+            print("Cancelled.", file=sys.stderr)
+            return
+        name, srv = found
+    else:
+        found = _find_server(servers, args.server)
+        if not found:
+            print(f"No server matching '{args.server}' found.", file=sys.stderr)
+            return
+        name, srv = found
     uuid = srv.get("uuid")
     title = srv.get("title", name)
     if not uuid:
@@ -455,11 +465,21 @@ def cmd_switch(args):
 
 def cmd_config(args):
     servers = load_servers()
-    found = _find_server(servers, args.server)
-    if not found:
-        print(f"No server matching '{args.server}' found.", file=sys.stderr)
+    if not servers:
+        print("No servers found.", file=sys.stderr)
         return
-    name, srv = found
+    if args.server is None:
+        found = _interactive_pick_server(servers)
+        if found is None:
+            print("Cancelled.", file=sys.stderr)
+            return
+        name, srv = found
+    else:
+        found = _find_server(servers, args.server)
+        if not found:
+            print(f"No server matching '{args.server}' found.", file=sys.stderr)
+            return
+        name, srv = found
     active_uuid = get_active_server_uuid()
     is_active = srv.get("uuid") == active_uuid
     print(f"Name:     {name}")
@@ -487,31 +507,11 @@ def cmd_set(args):
 
     if args.value is None:
         if args.key == "chain":
-            print(f"{'#':<5} {'Title':<40} {'Host':<25} {'Type':<8}")
-            print("-" * 82)
-            servers_list = list(servers.items())
-            for i, (sname, ssrv) in enumerate(servers_list):
-                host = str(ssrv.get("host", "") or "")
-                stype = str(ssrv.get("type", "") or "")
-                title = str(ssrv.get("title", sname) or "")[:38]
-                print(f"{i:<5} {title:<40} {host:<25} {stype:<8}")
-            print()
-
-            try:
-                choice = input("Select proxy for chain [index/name]: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-
-            if not choice:
+            found = _interactive_pick_server(servers, "Select proxy for chain")
+            if found is None:
                 print("Cancelled.", file=sys.stderr)
                 return
-
-            chain_found = _find_server(servers, choice)
-            if not chain_found:
-                print(f"No server matching '{choice}'.", file=sys.stderr)
-                return
-            chain_name, chain_srv = chain_found
+            chain_name, chain_srv = found
             chain_uuid = chain_srv.get("uuid")
             if not chain_uuid:
                 print(f"Server '{chain_name}' has no UUID.", file=sys.stderr)
@@ -561,6 +561,109 @@ def cmd_export(args):
     print(json.dumps(clean, indent=2, ensure_ascii=False, default=str))
 
 
+def _read_key(fd):
+    ch = os.read(fd, 1)
+    if not ch:
+        return None
+    if ch != b"\x1b":
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"\x03", b"\x04"):
+            return "cancel"
+        return ch.decode()
+
+    r, _, _ = select.select([fd], [], [], 0.03)
+    if not r:
+        return "escape"
+    extra = os.read(fd, 4)
+    seq = b"\x1b" + extra
+    if seq.startswith(b"\x1b[A"):
+        return "up"
+    if seq.startswith(b"\x1b[B"):
+        return "down"
+    if seq.startswith(b"\x1b[5"):
+        return "pgup"
+    if seq.startswith(b"\x1b[6"):
+        return "pgdn"
+    return "escape"
+
+
+def _interactive_pick_server(servers, prompt="Select server"):
+    items = list(servers.items())
+    if not items:
+        return None
+
+    idx = 0
+    n = len(items)
+    term_height = os.get_terminal_size().lines
+    max_visible = max(5, term_height - 5)
+    scroll_offset = 0
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+
+    def ensure_visible():
+        nonlocal scroll_offset
+        if idx < scroll_offset:
+            scroll_offset = idx
+        elif idx >= scroll_offset + max_visible:
+            scroll_offset = idx - max_visible + 1
+        scroll_offset = max(0, min(scroll_offset, max(0, n - max_visible)))
+
+    def draw():
+        ensure_visible()
+        end = min(scroll_offset + max_visible, n)
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.write(f"  {prompt}\r\n")
+        sys.stdout.write("  " + "-" * 78 + "\r\n")
+        for i in range(scroll_offset, end):
+            sname, ssrv = items[i]
+            host = str(ssrv.get("host", "") or "")[:25]
+            stype = str(ssrv.get("type", "") or "")[:8]
+            title = str(ssrv.get("title", sname) or "")[:38]
+            line = f"  {title:<38}  {host:<25} {stype:<8}"
+            if i == idx:
+                sys.stdout.write(f"\x1b[7m{line}\x1b[0m\r\n")
+            else:
+                sys.stdout.write(f"{line}\r\n")
+        for _ in range(end, scroll_offset + max_visible):
+            sys.stdout.write("\r\n")
+        more = f"({n - end} more below)" if end < n else ""
+        sys.stdout.write(f"\r\n  \u2191/\u2193 move  Enter select  Esc/q cancel  {idx + 1}/{n}  {more}\r\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            key = _read_key(fd)
+            if key == "up":
+                idx = (idx - 1) % n
+            elif key == "down":
+                idx = (idx + 1) % n
+            elif key == "pgup":
+                idx = max(0, idx - max_visible)
+            elif key == "pgdn":
+                idx = min(n - 1, idx + max_visible)
+            elif key in ("enter", " "):
+                break
+            elif key in ("escape", "cancel", None):
+                sys.stdout.write("\r\n")
+                return None
+            elif isinstance(key, str) and key.lower() == "q":
+                sys.stdout.write("\r\n")
+                return None
+            draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    name, srv = items[idx]
+    print(f"Selected: {name}")
+    return name, srv
+
+
 def cmd_active(args):
     servers = load_servers()
     uuid = get_active_server_uuid()
@@ -599,9 +702,9 @@ Examples:
     sub.add_parser("list", help="List all servers")
     sub.add_parser("active", help="Show active server")
     sp = sub.add_parser("switch", help="Switch active server")
-    sp.add_argument("server", help="Server index, UUID, or name substring")
+    sp.add_argument("server", nargs="?", default=None, help="Server index, UUID, or name substring")
     sp = sub.add_parser("config", help="Show server configuration")
-    sp.add_argument("server", help="Server index, UUID, or name substring")
+    sp.add_argument("server", nargs="?", default=None, help="Server index, UUID, or name substring")
     sp = sub.add_parser("set", help="Modify server property")
     sp.add_argument("server", help="Server index, UUID, or name substring")
     sp.add_argument("key", help="Property name")
