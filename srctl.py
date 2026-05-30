@@ -51,6 +51,86 @@ def _flush_prefs_cache():
         pass
 
 
+def _modify_server_field(server_uuid, key, value):
+    if not os.path.exists(SERVER_MGR):
+        raise FileNotFoundError(f"ServerManager not found: {SERVER_MGR}")
+
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
+        xml_path = tmp.name
+    try:
+        subprocess.run(
+            ["plutil", "-convert", "xml1", "-o", xml_path, SERVER_MGR],
+            check=True, capture_output=True,
+        )
+        with open(xml_path, "rb") as f:
+            plist_data = plistlib.load(f)
+
+        objects = plist_data["$objects"]
+
+        server_idx = None
+        for i, obj in enumerate(objects):
+            if not isinstance(obj, dict):
+                continue
+            class_ref = obj.get("$class")
+            if not isinstance(class_ref, dict) or "CF$UID" not in class_ref:
+                continue
+            cls = objects[class_ref["CF$UID"]]
+            if not isinstance(cls, dict) or cls.get("$classname") != "DLWServer":
+                continue
+            uuid_ref = obj.get("uuid")
+            if not isinstance(uuid_ref, dict) or "CF$UID" not in uuid_ref:
+                continue
+            uuid_obj = objects[uuid_ref["CF$UID"]]
+            if isinstance(uuid_obj, dict) and uuid_obj.get("NS.string") == server_uuid:
+                server_idx = i
+                break
+
+        if server_idx is None:
+            raise ValueError(f"Server with UUID {server_uuid} not found in ServerManager")
+
+        server_obj = objects[server_idx]
+        field_ref = server_obj.get(key)
+        if not isinstance(field_ref, dict) or "CF$UID" not in field_ref:
+            raise ValueError(f"Field '{key}' not found or unsupported type")
+
+        value_idx = field_ref["CF$UID"]
+        value_obj = objects[value_idx]
+
+        if isinstance(value_obj, dict) and "NS.string" in value_obj:
+            value_obj["NS.string"] = value
+        elif isinstance(value_obj, str):
+            objects[value_idx] = value
+        elif isinstance(value_obj, bool):
+            val_lower = value.lower()
+            if val_lower in ("true", "yes", "1"):
+                objects[value_idx] = True
+            elif val_lower in ("false", "no", "0"):
+                objects[value_idx] = False
+            else:
+                raise ValueError(f"Cannot convert '{value}' to bool")
+        elif isinstance(value_obj, (int, float)):
+            try:
+                objects[value_idx] = type(value_obj)(value)
+            except (ValueError, TypeError):
+                raise ValueError(f"Cannot convert '{value}' to {type(value_obj).__name__}")
+        else:
+            raise ValueError(f"Unsupported value type for field '{key}': {type(value_obj).__name__}")
+
+        with open(xml_path, "wb") as f:
+            plistlib.dump(plist_data, f)
+
+        bin_path = xml_path + ".bin"
+        subprocess.run(
+            ["plutil", "-convert", "binary1", "-o", bin_path, xml_path],
+            check=True, capture_output=True,
+        )
+        os.replace(bin_path, SERVER_MGR)
+    finally:
+        for p in (xml_path, xml_path + ".bin"):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
 def get_active_server_uuid():
     prefs = _read_prefs()
     return prefs.get(PREFS_KEY_UUID)
@@ -392,15 +472,44 @@ def cmd_config(args):
 
 def cmd_set(args):
     servers = load_servers()
+    if not servers:
+        print("No servers found.", file=sys.stderr)
+        return
     found = _find_server(servers, args.server)
     if not found:
         print(f"No server matching '{args.server}' found.", file=sys.stderr)
         return
     name, srv = found
-    print(f"Server: {name}")
-    print(f"Setting '{args.key}' = '{args.value}'")
-    print("Note: Direct modification of ServerManager archive is not supported.")
-    print("Shadowrocket will overwrite manual changes on next save.")
+    uuid = srv.get("uuid")
+    if not uuid:
+        print("Server has no UUID.", file=sys.stderr)
+        return
+
+    was_running = _is_shadowrocket_running()
+    was_connected = was_running and _is_vpn_connected()
+
+    if was_running:
+        print("Quitting Shadowrocket...")
+        if not _quit_shadowrocket():
+            print("Failed to quit Shadowrocket within timeout.", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        _modify_server_field(uuid, args.key, args.value)
+        print(f"Set '{args.key}' = '{args.value}' for '{name}'")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if was_running:
+        print("Relaunching Shadowrocket...")
+        if not _launch_shadowrocket():
+            print("Failed to relaunch Shadowrocket.", file=sys.stderr)
+            sys.exit(1)
+        if was_connected:
+            time.sleep(1.0)
+            subprocess.run(["open", "rocket://connect"], capture_output=True)
+            print("VPN reconnect sent")
 
 
 def cmd_export(args):
