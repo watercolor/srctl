@@ -438,6 +438,16 @@ def cmd_switch(args):
     was_running = _is_shadowrocket_running()
     was_connected = was_running and _is_vpn_connected()
 
+    if was_connected:
+        print("Disconnecting VPN...")
+        subprocess.run(["open", "rocket://disconnect"], capture_output=True)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not _is_vpn_connected():
+                print("VPN disconnected")
+                break
+            time.sleep(0.3)
+
     if was_running:
         print("Quitting Shadowrocket...")
         if not _quit_shadowrocket():
@@ -459,8 +469,7 @@ def cmd_switch(args):
             print("Failed to relaunch Shadowrocket.", file=sys.stderr)
             sys.exit(1)
         if was_connected:
-            # Give the app a moment to register its URL handler.
-            time.sleep(1.0)
+            time.sleep(1.5)
             subprocess.run(["open", "rocket://connect"], capture_output=True)
             print("VPN reconnect sent")
 
