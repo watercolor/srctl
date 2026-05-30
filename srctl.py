@@ -393,6 +393,39 @@ def cmd_toggle(*args):
     print("VPN toggle sent")
 
 
+def cmd_ps(*args):
+    running = _is_shadowrocket_running()
+    connected = running and _is_vpn_connected()
+    active = get_active_server_uuid()
+    print(f"Shadowrocket: {'RUNNING' if running else 'stopped'}")
+    print(f"VPN:          {'CONNECTED' if connected else 'disconnected'}")
+    if active:
+        servers = load_servers()
+        found = _find_server(servers, active)
+        if found:
+            name, srv = found
+            print(f"Server:       {name}  ({srv.get('host', '')}:{srv.get('port', '')})")
+
+
+def cmd_open(*args):
+    if _is_shadowrocket_running():
+        print("Shadowrocket is already running.")
+        return
+    subprocess.run(["open", "-a", "Shadowrocket"], capture_output=True)
+    print("Shadowrocket launched")
+
+
+def cmd_close(*args):
+    if not _is_shadowrocket_running():
+        print("Shadowrocket is not running.")
+        return
+    if _quit_shadowrocket():
+        print("Shadowrocket closed")
+    else:
+        print("Failed to close Shadowrocket.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_list(args):
     servers = load_servers()
     if not servers:
@@ -806,6 +839,9 @@ Examples:
     sub.add_parser("export", help="Export all servers as JSON")
     sp = sub.add_parser("ping", help="Test server connectivity (TCP)")
     sp.add_argument("server", nargs="?", default=None, help="Specific server (omit to test all)")
+    sub.add_parser("ps", help="Show Shadowrocket process status")
+    sub.add_parser("open", help="Launch Shadowrocket")
+    sub.add_parser("close", help="Quit Shadowrocket")
 
     args = parser.parse_args()
 
@@ -813,7 +849,7 @@ Examples:
         "on": cmd_on, "off": cmd_off, "toggle": cmd_toggle,
         "list": cmd_list, "switch": cmd_switch, "config": cmd_config,
         "set": cmd_set, "export": cmd_export, "active": cmd_active,
-        "ping": cmd_ping,
+        "ping": cmd_ping, "ps": cmd_ps, "open": cmd_open, "close": cmd_close,
     }
 
     handler = commands.get(args.command)
