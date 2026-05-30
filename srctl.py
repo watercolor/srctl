@@ -485,6 +485,43 @@ def cmd_set(args):
         print("Server has no UUID.", file=sys.stderr)
         return
 
+    if args.value is None:
+        if args.key == "chain":
+            print(f"{'#':<5} {'Title':<40} {'Host':<25} {'Type':<8}")
+            print("-" * 82)
+            servers_list = list(servers.items())
+            for i, (sname, ssrv) in enumerate(servers_list):
+                host = str(ssrv.get("host", "") or "")
+                stype = str(ssrv.get("type", "") or "")
+                title = str(ssrv.get("title", sname) or "")[:38]
+                print(f"{i:<5} {title:<40} {host:<25} {stype:<8}")
+            print()
+
+            try:
+                choice = input("Select proxy for chain [index/name]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+
+            if not choice:
+                print("Cancelled.", file=sys.stderr)
+                return
+
+            chain_found = _find_server(servers, choice)
+            if not chain_found:
+                print(f"No server matching '{choice}'.", file=sys.stderr)
+                return
+            chain_name, chain_srv = chain_found
+            chain_uuid = chain_srv.get("uuid")
+            if not chain_uuid:
+                print(f"Server '{chain_name}' has no UUID.", file=sys.stderr)
+                return
+            args.value = chain_uuid
+            print(f"Selected: {chain_name} ({chain_uuid})")
+        else:
+            print(f"Value is required for key '{args.key}'.", file=sys.stderr)
+            return
+
     was_running = _is_shadowrocket_running()
     was_connected = was_running and _is_vpn_connected()
 
@@ -568,7 +605,7 @@ Examples:
     sp = sub.add_parser("set", help="Modify server property")
     sp.add_argument("server", help="Server index, UUID, or name substring")
     sp.add_argument("key", help="Property name")
-    sp.add_argument("value", help="New value")
+    sp.add_argument("value", nargs="?", default=None, help="New value (interactive picker for 'chain' if omitted)")
     sub.add_parser("export", help="Export all servers as JSON")
 
     args = parser.parse_args()
